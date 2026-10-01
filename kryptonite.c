@@ -191,7 +191,7 @@ doca_error_t create_port_fwd_pipe(struct doca_flow_port *port,
 
 	doca_flow_pipe_cfg_destroy(pipe_cfg);
 
-	rc = doca_flow_pipe_add_entry(0, *pipe, &match, 
+	rc = doca_flow_pipe_add_entry(0, *pipe, &match, 0,
 		NULL, NULL, NULL, 0, status, NULL);
 	if (rc != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failure adding fwd pipe entry: %s", doca_error_get_descr(rc));
@@ -250,9 +250,10 @@ doca_error_t create_rss_pipe(struct doca_flow_port *port,
 	for (i = 0; i < num_rss_queues; i++)
 		rss_queues[i] = i;
 	fwd.type = DOCA_FLOW_FWD_RSS;
-	fwd.rss_queues = rss_queues;
-	fwd.rss_outer_flags = DOCA_FLOW_RSS_IPV4 | DOCA_FLOW_RSS_UDP | DOCA_FLOW_RSS_TCP;
-	fwd.num_of_queues = num_rss_queues;
+	fwd.rss_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
+	fwd.rss.queues_array = rss_queues;
+	fwd.rss.outer_flags = DOCA_FLOW_RSS_IPV4 | DOCA_FLOW_RSS_UDP | DOCA_FLOW_RSS_TCP;
+	fwd.rss.nr_queues = num_rss_queues;
 
 	rc = doca_flow_pipe_create(cfg, &fwd, NULL, pipe);
 	if (rc != DOCA_SUCCESS) {
@@ -263,7 +264,7 @@ doca_error_t create_rss_pipe(struct doca_flow_port *port,
 	doca_flow_pipe_cfg_destroy(cfg);
 
 	/* Match on any packet */
-	rc = doca_flow_pipe_add_entry(0, *pipe, &match, NULL, NULL, &fwd, 0, status, NULL);
+	rc = doca_flow_pipe_add_entry(0, *pipe, &match, 0, NULL, NULL, &fwd, 0, status, NULL);
 	if (rc != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failure adding RSS pipe entry: %s", doca_error_get_descr(rc));
 		return rc;
@@ -764,7 +765,7 @@ void entry_status_callback(struct doca_flow_pipe_entry *entry,
 
 		if (entries_status->export_on_delete || entries_status->sw_ct) {
 			/* Read entry key */
-			rc = doca_flow_ct_get_entry(pipe_queue, entries_status->pipe, 0 /* flags */, entry, &match_o, &match_r, &entry_flags);
+			rc = doca_flow_ct_get_entry(pipe_queue, entries_status->pipe, 0 /* flags */, entry, &match_o, &match_r, &entry_flags, NULL, NULL);
 			if (rc == DOCA_SUCCESS) {
 
 				if (entries_status->export_on_delete) {
@@ -886,11 +887,11 @@ destroy_pipe_cfg:
 doca_error_t run_flow_ct(struct app_context *app_context,
 			 u_int16_t num_queues,
 			 struct doca_dev *dev) {
-	struct doca_flow_ct_cfg ct_cfg = { 0 };
+	struct doca_flow_ct_cfg *ct_cfg = NULL;
 	struct doca_flow_meta o_zone_mask = { 0 };
-	struct doca_flow_meta o_modify_mask = { 0 };
+	struct doca_flow_ct_meta o_modify_mask = { 0 };
 	struct doca_flow_meta r_zone_mask = { 0 };
-	struct doca_flow_meta r_modify_mask = { 0 };
+	struct doca_flow_ct_meta r_modify_mask = { 0 };
 	struct doca_flow_pipe *rss_pipe = NULL;
 	struct doca_flow_pipe *port_fwd_pipe = NULL;
 	struct doca_flow_pipe *ct_pipe = NULL;
@@ -915,32 +916,34 @@ doca_error_t run_flow_ct(struct app_context *app_context,
 
 	/* Initialize DOCA Flow CT */
 
-	ct_cfg.flags = DOCA_FLOW_CT_FLAG_MANAGED;
-
-	ct_cfg.nb_arm_queues = nb_arm_queues;
-	ct_cfg.nb_ctrl_queues = nb_ctrl_queues;
-	ct_cfg.nb_user_actions = nb_user_actions;
-	ct_cfg.aging_core = nb_arm_queues + 1;
-	ct_cfg.flow_log_cb = NULL;
-	ct_cfg.nb_arm_sessions[DOCA_FLOW_CT_SESSION_IPV4] = MAX_NUM_FLOWS;
-	ct_cfg.nb_arm_sessions[DOCA_FLOW_CT_SESSION_IPV6] = 0;
-	ct_cfg.dup_filter_sz = 0;
+	u_int32_t ct_flags = 0;
+	u_int32_t dup_filter_sz = 0;
 
 	if (app_context->idle_timeout == 0) {
-		ct_cfg.flags |= DOCA_FLOW_CT_FLAG_NO_AGING
-			      | DOCA_FLOW_CT_FLAG_NO_COUNTER;
-		ct_cfg.dup_filter_sz = DUP_FILTER_CONN_NUM;
+		ct_flags = DOCA_FLOW_CT_FLAG_NO_AGING
+			 | DOCA_FLOW_CT_FLAG_NO_COUNTER;
+		dup_filter_sz = DUP_FILTER_CONN_NUM;
 	}
 
-	ct_cfg.direction[0].match_inner = false;
-	ct_cfg.direction[0].zone_match_mask = &o_zone_mask;
-	ct_cfg.direction[0].meta_modify_mask = &o_modify_mask;
+	rc = doca_flow_ct_cfg_create(&ct_cfg);
+	if (rc != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failure creating DOCA Flow CT config: %s", doca_error_get_name(rc));
+		doca_flow_destroy();
+		return rc;
+	}
 
-	ct_cfg.direction[1].match_inner = false;
-	ct_cfg.direction[1].zone_match_mask = &r_zone_mask;
-	ct_cfg.direction[1].meta_modify_mask = &r_modify_mask;
+	doca_flow_ct_cfg_set_flags(ct_cfg, ct_flags);
+	doca_flow_ct_cfg_set_queues(ct_cfg, nb_arm_queues);
+	doca_flow_ct_cfg_set_ctrl_queues(ct_cfg, nb_ctrl_queues);
+	doca_flow_ct_cfg_set_user_actions(ct_cfg, nb_user_actions);
+	doca_flow_ct_cfg_set_aging_core(ct_cfg, nb_arm_queues + 1);
+	doca_flow_ct_cfg_set_connections(ct_cfg, MAX_NUM_FLOWS, 0, 0);
+	doca_flow_ct_cfg_set_dup_filter_size(ct_cfg, dup_filter_sz);
+	doca_flow_ct_cfg_set_direction(ct_cfg, false, false, &o_zone_mask, &o_modify_mask);
+	doca_flow_ct_cfg_set_direction(ct_cfg, true, false, &r_zone_mask, &r_modify_mask);
 
-	rc = doca_flow_ct_init(&ct_cfg);
+	rc = doca_flow_ct_init(ct_cfg);
+	doca_flow_ct_cfg_destroy(ct_cfg);
 	if (rc != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failure initializing DOCA Flow CT: %s", doca_error_get_name(rc));
 		doca_flow_destroy();
@@ -1033,28 +1036,12 @@ doca_error_t init_doca_flow(int num_queues,
 			    const char *mode,
 			    doca_flow_entry_process_cb callback) {
 	struct doca_flow_cfg *flow_cfg;
-	u_int16_t queue_id;
-	u_int16_t queues[num_queues];
-	struct doca_flow_resource_rss_cfg rss = {0};
 	doca_error_t rc, tmp_rc;
-	int i;
 
 	rc = doca_flow_cfg_create(&flow_cfg);
 	if (rc != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failure creating doca_flow_cfg: %s", doca_error_get_descr(rc));
 		return rc;
-	}
-
-	for (queue_id = 0; queue_id < num_queues; queue_id++)
-		queues[queue_id] = queue_id;
-
-	rss.queues_array = queues;
-	rss.nr_queues = num_queues;
-
-	rc = doca_flow_cfg_set_default_rss(flow_cfg, &rss);
-	if (rc != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failure setting doca_flow_cfg RSS: %s", doca_error_get_descr(rc));
-		goto destroy_cfg;
 	}
 
 	rc = doca_flow_cfg_set_pipe_queues(flow_cfg, num_queues);
